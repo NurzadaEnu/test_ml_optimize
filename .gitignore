@@ -1,0 +1,5 @@
+# Trained models are large (~20 MB each) — regenerate with: python3 train_model.py
+models/
+*.joblib
+__pycache__/
+.DS_Store
