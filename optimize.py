@@ -1,101 +1,146 @@
 """
 optimize.py
 ===========
-Использует  ML-модели (не исходные формулы генератора!) как
-"черный ящик" и ищет режим (x1...x5), максимизирующий объем гидрогенизата
-y1 при условии, что взвешенный критерий качества Score >= порога.
+Единая задача оптимизации (Eq. 16 в статье) на суррогатах XGBoost:
 
-Score = beta1*mu1 + beta2*mu2 + beta3*mu3
-Веса beta взяты из диссертации (важность требований для ЛПР): 0.35 / 0.40 / 0.25
+    max  y1(x)
+    s.t. Score(x) = 0.35*mu1 + 0.40*mu2 + 0.25*mu3 >= 0.90
+         y1(x) <= x1                    (баланс объёма, явное ограничение)
+         x in BOUNDS
+
+Двухэтапная лексикографическая постановка (старое Eq. 17) удалена.
+Дополнительно:
+  * проверка рекомендованного режима на исходном генераторе            (R1-3)
+  * сравнение режимов таблицы 1 на ОДНОЙ общей модели качества          (R1-5)
+  * Рис. 5: чувствительность y1 и Score к температуре + фронт
+    объём-качество (epsilon-constraint)                       (R1-2, R2-3, R2-4)
+  * проверка утечки: давление фиксировано на значении AorRA+PO (28)     (R2-6)
 """
 
 import joblib
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-from generate_data import BOUNDS, ANCHOR_POINTS, MU_ANCHOR
+from generate_data import BOUNDS, TARGETS, ANCHOR_POINTS, compute_y1, compute_mu_quality
 
-FEATURES = ["x1_syre", "x2_davlenie", "x3_temperatura", "x4_skorost", "x5_vsg"]
-BETA = {"mu1": 0.35, "mu2": 0.40, "mu3": 0.25}
+BETA = np.array([0.35, 0.40, 0.25])
 SCORE_THRESHOLD = 0.90
+KEYS = ["x1", "x2", "x3", "x4", "x5"]
 
 
 def load_models():
-    return {
-        "y1": joblib.load("models/rf_y1_obyem.joblib"),
-        "mu1": joblib.load("models/rf_mu1_nepredelnye.joblib"),
-        "mu2": joblib.load("models/rf_mu2_sera.joblib"),
-        "mu3": joblib.load("models/rf_mu3_kisloty.joblib"),
-    }
+    return {t: joblib.load(f"models/xgb_{t}.joblib") for t in TARGETS}
 
 
-def predict_all(models, X):
-    """X: (n,5) массив в порядке x1..x5. Возвращает y1, mu1, mu2, mu3."""
-    y1 = models["y1"].predict(X)
-    mu1 = models["mu1"].predict(X)
-    mu2 = models["mu2"].predict(X)
-    mu3 = models["mu3"].predict(X)
-    return y1, mu1, mu2, mu3
+def surrogate(models, X):
+    y1 = models["y1_obyem"].predict(X)
+    mu = np.column_stack([models[t].predict(X) for t in TARGETS[1:]])
+    return y1, mu, mu @ BETA
 
 
-def random_search_optimize(models, n_samples=20000, threshold=SCORE_THRESHOLD, seed=7):
-    """
-    Простой, но честный и прозрачный метод: случайный перебор внутри
-    разрешенных границ + фильтр по порогу качества + выбор максимума объема.
-    (Тот самый механизм, который мы разбирали на примере таблицы вариантов A-D.)
-    """
+def generator(X):
+    X = np.atleast_2d(X)
+    y1 = compute_y1(X[:, 0], X[:, 1], X[:, 2])
+    mu = np.column_stack(compute_mu_quality(*[X[:, i] for i in range(5)]))
+    return y1, mu, mu @ BETA
+
+
+def sample(n, seed, fixed=None):
     rng = np.random.default_rng(seed)
-    X = np.column_stack([
-        rng.uniform(*BOUNDS["x1"], n_samples),
-        rng.uniform(*BOUNDS["x2"], n_samples),
-        rng.uniform(*BOUNDS["x3"], n_samples),
-        rng.uniform(*BOUNDS["x4"], n_samples),
-        rng.uniform(*BOUNDS["x5"], n_samples),
-    ])
+    cols = []
+    for k in KEYS:
+        if fixed and k in fixed:
+            cols.append(np.full(n, float(fixed[k])))
+        else:
+            cols.append(rng.uniform(*BOUNDS[k], n))
+    return np.column_stack(cols)
 
-    y1, mu1, mu2, mu3 = predict_all(models, X)
-    score = BETA["mu1"] * mu1 + BETA["mu2"] * mu2 + BETA["mu3"] * mu3
 
-    feasible = score >= threshold
-    if feasible.sum() == 0:
-        raise RuntimeError(f"Ни один из {n_samples} вариантов не преодолел порог качества {threshold}")
+def solve(models, eps=SCORE_THRESHOLD, n=60_000, seed=7, fixed=None, X=None):
+    """max y1 s.t. Score>=eps, y1<=x1 (случайный поиск по суррогату)."""
+    if X is None:
+        X = sample(n, seed, fixed)
+    y1, mu, score = surrogate(models, X)
+    feas = (score >= eps) & (y1 <= X[:, 0])
+    if not feas.any():
+        return None
+    i = np.where(feas)[0][np.argmax(y1[feas])]
+    return {"x": X[i], "y1": y1[i], "mu": mu[i], "score": score[i], "n_feasible": int(feas.sum())}
 
-    idx_feasible = np.where(feasible)[0]
-    best_local = idx_feasible[np.argmax(y1[idx_feasible])]
 
-    result = {
-        "x1": X[best_local, 0], "x2": X[best_local, 1], "x3": X[best_local, 2],
-        "x4": X[best_local, 3], "x5": X[best_local, 4],
-        "y1": y1[best_local], "mu1": mu1[best_local], "mu2": mu2[best_local],
-        "mu3": mu3[best_local], "score": score[best_local],
-        "n_feasible": int(feasible.sum()), "n_total": n_samples,
-    }
-    return result
+def figure5(models, best, X_pool, path="plots/fig5_sensitivity_front.png"):
+    T = np.linspace(*BOUNDS["x3"], 120)
+    Xs = np.repeat(best["x"][None, :], len(T), 0)
+    Xs[:, 2] = T
+    y1g, _, sg = generator(Xs)
+    y1s, _, ss = surrogate(models, Xs)
+
+    eps_grid = np.round(np.arange(0.80, 0.971, 0.01), 2)
+    front = []
+    for e in eps_grid:
+        r = solve(models, eps=e, X=X_pool)
+        if r is not None:
+            front.append((e, r["y1"]))
+    front = np.array(front)
+
+    fig, (a, b) = plt.subplots(1, 2, figsize=(12, 4.3))
+    a.plot(T, y1g, color="#1f4e79", label="y1, генератор")
+    a.plot(T, y1s, "--", color="#1f4e79", alpha=.6, label="y1, XGBoost")
+    a.set_xlabel("Температура x3, °C"); a.set_ylabel("y1, м³/ч")
+    a2 = a.twinx()
+    a2.plot(T, sg, color="#b45309", label="Score, генератор")
+    a2.plot(T, ss, "--", color="#b45309", alpha=.6, label="Score, XGBoost")
+    a2.axhline(SCORE_THRESHOLD, color="gray", lw=.8, ls=":")
+    a2.set_ylabel("Score")
+    a.axvline(best["x"][2], color="k", lw=.8, ls=":")
+    h1, l1 = a.get_legend_handles_labels(); h2, l2 = a2.get_legend_handles_labels()
+    a.legend(h1 + h2, l1 + l2, fontsize=8, loc="lower left")
+    a.set_title("(a) Чувствительность к температуре")
+    b.plot(front[:, 0], front[:, 1], "o-", color="#1f4e79")
+    b.set_xlabel("Порог качества ε (Score ≥ ε)"); b.set_ylabel("max y1, м³/ч")
+    b.set_title("(b) Фронт объём–качество (ε-constraint)")
+    plt.tight_layout(); plt.savefig(path, dpi=150); plt.close(fig)
+    pd.DataFrame(front, columns=["eps", "y1_max"]).to_csv("data/eps_front.csv", index=False)
+    print(f"Сохранено: {path}, data/eps_front.csv")
+
+
+def fmt(x):
+    return f"x1={x[0]:.1f} x2={x[1]:.1f} x3={x[2]:.1f} x4={x[3]:.2f} x5={x[4]:.0f}"
 
 
 if __name__ == "__main__":
     models = load_models()
-    result = random_search_optimize(models)
+    X_pool = sample(60_000, 7)
+    best = solve(models, X=X_pool)
 
-    print("=" * 70)
-    print("ОПТИМИЗАЦИЯ (на основе ОБУЧЕННОЙ ML-модели, не исходных формул)")
-    print("=" * 70)
-    print(f"Из {result['n_total']} случайных вариантов допустимыми (Score>=0.90) "
-          f"оказались {result['n_feasible']}\n")
-    print(f"Найденный оптимальный режим:")
-    print(f"  x1 (сырье)        = {result['x1']:.1f} м3/час")
-    print(f"  x2 (давление)     = {result['x2']:.1f} кг/см2")
-    print(f"  x3 (температура)  = {result['x3']:.1f} C")
-    print(f"  x4 (скорость)     = {result['x4']:.2f} час^-1")
-    print(f"  x5 (ВСГ)          = {result['x5']:.0f} нм3")
-    print(f"\n  y1 (объем)  = {result['y1']:.2f} м3/час")
-    print(f"  mu1={result['mu1']:.3f}  mu2={result['mu2']:.3f}  mu3={result['mu3']:.3f}")
-    print(f"  Score = {result['score']:.3f}")
+    print("=" * 74 + "\nРЕКОМЕНДОВАННЫЙ РЕЖИМ (суррогат XGBoost, Eq. 16)\n" + "=" * 74)
+    print(f"Допустимых вариантов: {best['n_feasible']} из {len(X_pool)}")
+    print(f"  {fmt(best['x'])}")
+    print(f"  суррогат : y1={best['y1']:.2f}  mu={np.round(best['mu'], 3)}  Score={best['score']:.3f}")
+    y1g, mug, sg = generator(best["x"])
+    print(f"  генератор: y1={y1g[0]:.2f}  mu={np.round(mug[0], 3)}  Score={sg[0]:.3f}")
+    print(f"  y1 <= x1 : {y1g[0]:.2f} <= {best['x'][0]:.1f}  -> {bool(y1g[0] <= best['x'][0])}")
+    print(f"  расхождение суррогат-генератор по y1: {abs(best['y1'] - y1g[0]):.2f} м3/ч")
 
-    print("\n" + "-" * 70)
-    print("Сравнение с диссертацией (таблица 4.4):")
-    print("-" * 70)
-    comp = ANCHOR_POINTS.copy()
-    comp.loc[len(comp)] = [result["x1"], result["x2"], result["x3"], result["x4"],
-                            result["x5"], result["y1"], "ML-optimizer (this run)"]
-    print(comp.to_string(index=False))
+    print("\n" + "-" * 74 + "\nТаблица 1: все режимы на ОДНОЙ общей модели качества (генератор)\n" + "-" * 74)
+    rows = []
+    for _, r in ANCHOR_POINTS.iterrows():
+        x = np.array([r.x1, r.x2, r.x3, r.x4, r.x5], float)
+        y, m, s = generator(x)
+        rows.append([r.method, *x, y[0], *m[0], s[0]])
+    rows.append(["XGBoost + Eq.16", *best["x"], y1g[0], *mug[0], sg[0]])
+    tab = pd.DataFrame(rows, columns=["method", *KEYS, "y1", "mu1", "mu2", "mu3", "Score"])
+    print(tab.round(3).to_string(index=False))
+    tab.to_csv("data/table1_common_model.csv", index=False)
+
+    print("\n" + "-" * 74 + "\nПроверка утечки (R2-6): x2 фиксировано = 28 (как в AorRA+PO)\n" + "-" * 74)
+    r28 = solve(models, fixed={"x2": 28.0}, seed=11)
+    if r28 is None:
+        print("  при x2=28 нет режимов со Score >= 0.90")
+    else:
+        print(f"  {fmt(r28['x'])}  y1={r28['y1']:.2f}  Score={r28['score']:.3f}")
+
+    figure5(models, best, X_pool)

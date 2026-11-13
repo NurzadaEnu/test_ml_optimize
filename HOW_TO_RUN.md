@@ -3,104 +3,54 @@
 ## Требования
 
 ```bash
-pip install numpy pandas scikit-learn matplotlib joblib --break-system-packages
+pip install -r requirements.txt
 ```
-(если это не sandbox-окружение с ограничением pip — просто `pip install ...` без флага)
-
 
 ## Этап 1 — Генерация данных (`generate_data.py`)
 
-**Что делает:** строит синтетический датасет (3000 строк) — физически мотивированная
-модель (кинетика HDS/гидрирования) + калибровка по 3 реальным точкам из диссертации.
+Синтетический датасет (3000 строк):
+- **Объём:** `y1 = x1·η(x2,x3)`, η откалибрована МНК по трём режимам таблицы 1; η ≤ 0.995, поэтому `y1 < x1`.
+- **Качество:** μ1–μ3 — степени превращения (реактор вытеснения 1-го порядка, кинетика Аррениуса), откалиброванные в центре рабочих диапазонов (x2 = 27.5, x3 = 321.5, x4 = 2.75, x5 = 350). Решение AorRA+PO в генераторе не используется.
 
 ```bash
 python3 generate_data.py
 ```
 
-**Что увидите:**
+Ожидаемый вывод:
 ```
-Сгенерировано 3000 строк -> data/synthetic_dataset.csv
-Калибровочные коэффициенты модели потерь объема:
-  L0=-0.040396  L1=0.009342  L3=-0.010889
-Проверка на опорных точках (должны совпадать с диссертацией):
-  deterministic         : y1_real=76.5  y1_model=76.50
-  AorRA+PO (proposed)   : y1_real=78.0  y1_model=78.00
-  real_production       : y1_real=77.5  y1_model=77.50
-```
-Если цифры `y1_real` и `y1_model` совпадают — калибровка прошла верно.
-
-**Результат:** файл `data/synthetic_dataset.csv`.
-
-## Этап 2 — Обучение моделей (`train_model.py`)
-
-**Что делает:** обучает 4 модели Random Forest (для y1, mu1, mu2, mu3) на 80% данных,
-проверяет на оставшихся 20%, строит графики.
-
-```bash
-python3 train_model.py
+deterministic       : y1_table=76.0  y1_model=76.00
+AorRA+PO (fuzzy)    : y1_table=77.5  y1_model=77.50
+real_production     : y1_table=77.0  y1_model=77.00
 ```
 
-**Что увидите:**
-```
-y1_obyem              R2=0.9632   MAE=1.5555   MAPE=2.55%
-mu1_nepredelnye       R2=0.9865   MAE=0.0196   MAPE=3.67%
-mu2_sera              R2=0.9822   MAE=0.0259   MAPE=10.15%
-mu3_kisloty           R2=0.9925   MAE=0.0173   MAPE=4.63%
-Сохранено: plots/parity_plots.png
-Сохранено: plots/feature_importance.png
-Модели сохранены в models/*.joblib
-```
+## Этап 2 — Обучение (`train_model.py`)
 
-**Результат:**
-- `models/rf_y1_obyem.joblib`, `models/rf_mu1_nepredelnye.joblib`, `models/rf_mu2_sera.joblib`, `models/rf_mu3_kisloty.joblib`
-- `plots/parity_plots.png` — точки предсказания vs реальность (чем ближе к диагонали, тем лучше)
-- `plots/feature_importance.png` — какой параметр (x1-x5) сильнее всего влияет на каждый показатель
+4 модели XGBoost (n_estimators=600, max_depth=5, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9), разбиение 80:20. Печатает RMSE, R², MAE на тесте → `data/test_metrics.csv`, графики `plots/parity_plots.png`, `plots/feature_importance.png`.
 
 ## Этап 3 — Валидация (`validate_model.py`)
 
-**Что делает:** три уровня проверки — train/test split, 5-fold cross-validation,
-и (самое важное) сверка предсказаний обученной модели с реальными точками из диссертации.
+- 5-fold CV: R² по фолдам, mean ± std → `data/cv_metrics.csv`. Синтетические выборки независимы (нет автокорреляции), поэтому случайный K-fold корректен.
+- Для реальных данных — `cross_validation(df, time_ordered=True)` (TimeSeriesSplit).
+- Сверка суррогата с генератором на режимах таблицы 1.
 
-```bash
-python3 validate_model.py
-```
+## Этап 4 — Оптимизация (`optimize.py`)
 
-**На что смотреть:**
-- **Уровень 1-2** — R² в районе 0.96-0.99 и маленький разброс (std) по фолдам = модель
-  стабильно предсказывает синтетические данные (ожидаемо, техническая проверка пайплайна).
-- **Уровень 3** — ошибка предсказания на 3 реальных точках диссертации (должна быть
-  в пределах 0.03-0.6 м³/ч для объёма) — это единственная проверка на настоящих цифрах,
-  а не на синтетике.
+Единая задача (Eq. 16): `max y1` при `Score ≥ 0.90` и `y1 ≤ x1`, случайный поиск по 60 000 точкам на суррогате.
+- проверка рекомендованного режима на генераторе;
+- `data/table1_common_model.csv` — все режимы на одной модели качества;
+- `plots/fig5_sensitivity_front.png` — (a) y1 и Score vs температура, (b) фронт ε-constraint (`data/eps_front.csv`);
+- проверка утечки: оптимизация при x2 = 28 (как у AorRA+PO).
 
-## Этап 4 — Поиск оптимального режима (`optimize.py`)
+## Сравнение алгоритмов (`compare_models.py`)
 
-**Что делает:** берёт обученные модели, случайно перебирает 20 000 комбинаций x1-x5
-в разрешённых границах, отбрасывает варианты с качеством ниже порога (Score<0.90),
-выбирает максимум объёма среди оставшихся.
+8 алгоритмов, 5-fold CV → `data/model_comparison.csv`, `plots/model_comparison.png`.
 
-```bash
-python3 optimize.py
-```
-
-**Что увидите:** рекомендуемый режим (x1...x5), его объём и Score, сравнение с
-3 методами из диссертации в виде таблицы.
-
-## Полный запуск одной командой (всё по порядку)
+## Полный запуск
 
 ```bash
 python3 generate_data.py && python3 train_model.py && python3 validate_model.py && python3 optimize.py
 ```
 
-## Когда появятся реальные данные завода
+## Реальные данные завода
 
-Замените **только** `data/synthetic_dataset.csv` на реальный CSV с теми же именами колонок:
-`x1_syre, x2_davlenie, x3_temperatura, x4_skorost, x5_vsg, y1_obyem, mu1_nepredelnye, mu2_sera, mu3_kisloty`
-
-Затем заново: `python3 train_model.py && python3 validate_model.py && python3 optimize.py`
-(этап `generate_data.py` больше не нужен).
-
-Дополнительно нужно будет:
-- в `optimize.py` сузить границы `BOUNDS` до диапазонов, реально встречавшихся в
-  исторических данных (не до формальных паспортных границ оборудования);
-- в `validate_model.py` заменить "Уровень 3" на полноценную проверку по отложенным
-  во времени реальным данным (не перемешивая случайно, так как процесс — временной ряд).
+Замените `data/synthetic_dataset.csv` (те же колонки: `x1_syre, x2_davlenie, x3_temperatura, x4_skorost, x5_vsg, y1_obyem, mu1_nepredelnye, mu2_sera, mu3_kisloty`), запустите этапы 2–4, используйте временной сплит и сузьте `BOUNDS` до исторических диапазонов.

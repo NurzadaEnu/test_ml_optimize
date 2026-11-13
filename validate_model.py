@@ -1,105 +1,57 @@
 """
 validate_model.py
 ==================
-Полная валидация обученных моделей — 3 уровня проверки:
-  1) Train/test split (80/20)      -- базовая проверка на неучаствовавших в обучении данных
-  2) 5-fold cross-validation       -- проверка устойчивости результата (не повезло ли с разбиением)
-  3) Проверка на РЕАЛЬНЫХ точках   -- сверка предсказаний обученной модели с реальными
-                                       производственными данными из диссертации (самая
-                                       важная проверка: не "как модель предсказывает синтетику",
-                                       а "насколько она близка к тому, что было на заводе")
-
-ЗАПУСК:
-    python3 validate_model.py
-Требует, чтобы до этого были выполнены generate_data.py и train_model.py
-(модели должны лежать в models/*.joblib).
+Валидация суррогатов XGBoost:
+  1) Train/test 80:20 -- RMSE, R2, MAE                         (R2-11)
+  2) 5-fold CV -- R2 mean +/- std по фолдам                    (R2-11)
+     Синтетические выборки независимы и равномерны (нет автокорреляции),
+     поэтому случайный K-fold корректен. Для реальных заводских данных
+     нужен временной (блочный) сплит -- TimeSeriesSplit.            (R2-7)
+  3) Сверка суррогата с генератором на опорных режимах таблицы 1.
 """
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import KFold, cross_val_score, train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import KFold, TimeSeriesSplit, cross_val_score
 
-from generate_data import ANCHOR_POINTS, MU_ANCHOR
-
-FEATURES = ["x1_syre", "x2_davlenie", "x3_temperatura", "x4_skorost", "x5_vsg"]
-TARGETS = ["y1_obyem", "mu1_nepredelnye", "mu2_sera", "mu3_kisloty"]
+from generate_data import FEATURES, TARGETS, ANCHOR_POINTS, compute_y1, compute_mu_quality
+from train_model import make_model
 
 
 def section(title):
-    print("\n" + "=" * 78)
-    print(title)
-    print("=" * 78)
+    print("\n" + "=" * 78 + f"\n{title}\n" + "=" * 78)
 
 
-def level1_train_test_split(df):
-    section("УРОВЕНЬ 1: Train/test split (80/20)")
+def cross_validation(df, time_ordered=False):
     X = df[FEATURES].values
+    cv = TimeSeriesSplit(n_splits=5) if time_ordered else KFold(5, shuffle=True, random_state=42)
+    rows = []
     for target in TARGETS:
-        y = df[target].values
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model = RandomForestRegressor(n_estimators=400, max_depth=12, min_samples_leaf=3,
-                                       random_state=42, n_jobs=-1)
-        model.fit(X_train, y_train)
-        pred = model.predict(X_test)
-        r2 = r2_score(y_test, pred)
-        mae = mean_absolute_error(y_test, pred)
-        print(f"  {target:20s}  R2={r2:.4f}   MAE={mae:.4f}   (проверка на {len(y_test)} отложенных примерах)")
+        s = cross_val_score(make_model(), X, df[target].values, cv=cv, scoring="r2")
+        rows.append({"target": target, "R2_mean": s.mean(), "R2_std": s.std()})
+        print(f"  {target:18s}  R2 по фолдам {np.round(s, 3)}  -> {s.mean():.4f} +/- {s.std():.4f}")
+    return pd.DataFrame(rows)
 
 
-def level2_cross_validation(df):
-    section("УРОВЕНЬ 2: 5-fold cross-validation (проверка устойчивости)")
-    X = df[FEATURES].values
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    for target in TARGETS:
-        y = df[target].values
-        model = RandomForestRegressor(n_estimators=300, max_depth=12, min_samples_leaf=3,
-                                       random_state=42, n_jobs=-1)
-        scores = cross_val_score(model, X, y, cv=kf, scoring="r2")
-        print(f"  {target:20s}  R2 по фолдам: {np.round(scores, 3)}   "
-              f"среднее={scores.mean():.4f}  std={scores.std():.4f}")
-
-
-def level3_real_anchor_check():
-    section("УРОВЕНЬ 3: проверка на РЕАЛЬНЫХ точках из диссертации (главная проверка)")
-    models = {t: joblib.load(f"models/rf_{t}.joblib") for t in TARGETS}
-
-    print("\n  Объём (y1) -- 3 реальные производственные строки таблицы 4.4:")
-    for _, row in ANCHOR_POINTS.iterrows():
-        X = np.array([[row.x1, row.x2, row.x3, row.x4, row.x5]])
-        pred = models["y1_obyem"].predict(X)[0]
-        err = abs(pred - row.y1)
-        print(f"    {row.method:22s}: реальное={row.y1:.1f}   ML-предсказание={pred:.2f}   ошибка={err:.2f} м3/ч")
-
-    print("\n  Качество (mu1, mu2, mu3) -- единственная проверенная точка (AorRA+PO):")
-    X_mu = np.array([[MU_ANCHOR[k] for k in ["x1", "x2", "x3", "x4", "x5"]]])
-    mu1p = models["mu1_nepredelnye"].predict(X_mu)[0]
-    mu2p = models["mu2_sera"].predict(X_mu)[0]
-    mu3p = models["mu3_kisloty"].predict(X_mu)[0]
-    print(f"    реальные:   mu1=1.00  mu2=1.00  mu3=0.98")
-    print(f"    предсказано: mu1={mu1p:.3f}  mu2={mu2p:.3f}  mu3={mu3p:.3f}")
+def anchor_check():
+    models = {t: joblib.load(f"models/xgb_{t}.joblib") for t in TARGETS}
+    for _, r in ANCHOR_POINTS.iterrows():
+        X = np.array([[r.x1, r.x2, r.x3, r.x4, r.x5]])
+        y1s = models["y1_obyem"].predict(X)[0]
+        mus = [models[t].predict(X)[0] for t in TARGETS[1:]]
+        mug = compute_mu_quality(r.x1, r.x2, r.x3, r.x4, r.x5)
+        print(f"  {r.method:18s} y1: table={r.y1:.1f} gen={float(compute_y1(r.x1, r.x2, r.x3)):.2f} "
+              f"surr={y1s:.2f} | mu gen={np.round(np.array(mug, float), 3)} surr={np.round(mus, 3)}")
 
 
 if __name__ == "__main__":
     df = pd.read_csv("data/synthetic_dataset.csv")
-    print(f"Датасет: {len(df)} строк, {len(FEATURES)} признаков, {len(TARGETS)} целевых показателей")
-
-    level1_train_test_split(df)
-    level2_cross_validation(df)
-    level3_real_anchor_check()
-
-    section("ИТОГ")
-    print("""
-  Уровень 1-2 показывают, что модель стабильно предсказывает СИНТЕТИЧЕСКИЕ данные
-  (это ожидаемо -- проверка того, что пайплайн работает технически).
-
-  Уровень 3 -- единственная проверка на РЕАЛЬНЫХ цифрах. Ошибка 0.03-0.62 м3/ч
-  на объеме -- хороший знак для синтетического прототипа, но это ТРИ точки,
-  этого недостаточно для доверия модели в реальном производстве.
-
-  Когда появятся реальные данные завода -- замените data/synthetic_dataset.csv
-  и повторите весь этот скрипт заново. Уровень 3 тогда нужно будет заменить на
-  полноценный test-split по реальным историческим данным.
-""")
+    section("1) Test-метрики (80:20): см. train_model.py / data/test_metrics.csv")
+    print(pd.read_csv("data/test_metrics.csv").to_string(index=False))
+    section("2) 5-fold CV (случайный, синтетика без автокорреляции)")
+    cv = cross_validation(df)
+    cv.to_csv("data/cv_metrics.csv", index=False)
+    section("3) Опорные режимы таблицы 1: генератор vs суррогат")
+    anchor_check()
+    print("\nДля реальных (упорядоченных во времени) данных: cross_validation(df, time_ordered=True)")
