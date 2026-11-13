@@ -1,14 +1,14 @@
 """
 train_model.py
 ===============
-Обучает суррогатные модели XGBoost для y1, mu1, mu2, mu3.
+Trains XGBoost surrogate models for y1, mu1, mu2, mu3.
 
-Настройки (указаны в статье, раздел 3.3):
-  * разбиение 80:20 (random_state=42)
+Settings (stated in the paper, Section 3.3):
+  * 80:20 train/test split (random_state=42)
   * XGBoost: n_estimators=600, max_depth=5, learning_rate=0.05,
              subsample=0.9, colsample_bytree=0.9, random_state=42
-  * метрики на тестовой выборке: RMSE, R2, MAE
-  * 5-fold CV: R2 mean +/- std по фолдам  (см. validate_model.py)
+  * test-set metrics: RMSE, R2, MAE
+  * 5-fold CV: R2 mean +/- std across folds (see validate_model.py)
 """
 
 import os
@@ -29,8 +29,8 @@ XGB_PARAMS = dict(n_estimators=600, max_depth=5, learning_rate=0.05,
                   random_state=42, n_jobs=-1, verbosity=0)
 
 FEATURE_LABELS = {
-    "x1_syre": "x1 сырьё", "x2_davlenie": "x2 давление", "x3_temperatura": "x3 температура",
-    "x4_skorost": "x4 скорость подачи", "x5_vsg": "x5 ВСГ",
+    "x1_feed": "x1 feed", "x2_pressure": "x2 pressure", "x3_temperature": "x3 temperature",
+    "x4_lhsv": "x4 LHSV", "x5_h2_ratio": "x5 H2/HC",
 }
 
 
@@ -63,12 +63,12 @@ def plot_parity(metrics, path="plots/parity_plots.png"):
         lims = [min(m["y_test"].min(), m["y_pred"].min()), max(m["y_test"].max(), m["y_pred"].max())]
         ax.plot(lims, lims, "--", color="#374151", linewidth=1)
         ax.set_title(f"{target}\nR2={m['r2']:.3f}  RMSE={m['rmse']:.3f}", fontsize=10)
-        ax.set_xlabel("генератор (test)")
-        ax.set_ylabel("XGBoost")
+        ax.set_xlabel("generator (test set)")
+        ax.set_ylabel("XGBoost prediction")
     plt.tight_layout()
     plt.savefig(path, dpi=130)
     plt.close(fig)
-    print(f"Сохранено: {path}")
+    print(f"Saved: {path}")
 
 
 def plot_feature_importance(models, path="plots/feature_importance.png"):
@@ -82,14 +82,14 @@ def plot_feature_importance(models, path="plots/feature_importance.png"):
     plt.tight_layout()
     plt.savefig(path, dpi=130)
     plt.close(fig)
-    print(f"Сохранено: {path}")
+    print(f"Saved: {path}")
 
 
 if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     os.makedirs("plots", exist_ok=True)
     df = pd.read_csv("data/synthetic_dataset.csv")
-    print(f"Загружено {len(df)} строк\n")
+    print(f"Loaded {len(df)} rows\n")
     models, metrics = train_all(df)
     pd.DataFrame([{"target": t, "RMSE": m["rmse"], "R2": m["r2"], "MAE": m["mae"]}
                   for t, m in metrics.items()]).to_csv("data/test_metrics.csv", index=False)
@@ -97,4 +97,4 @@ if __name__ == "__main__":
         joblib.dump(model, f"models/xgb_{target}.joblib")
     plot_parity(metrics)
     plot_feature_importance(models)
-    print("\nМодели сохранены в models/xgb_*.joblib, метрики -> data/test_metrics.csv")
+    print("\nModels saved to models/xgb_*.joblib, metrics -> data/test_metrics.csv")

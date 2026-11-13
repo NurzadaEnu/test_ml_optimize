@@ -1,21 +1,21 @@
 """
 compare_models.py
 ==================
-Сравнивает несколько ML-алгоритмов на датасете
+Compares several ML algorithms on the synthetic dataset (5-fold CV).
 
-Алгоритмы:
-  - Linear Regression      -- простейший baseline (линейная зависимость)
-  - Ridge Regression       -- линейная + регуляризация
-  - KNN                    -- метод ближайших соседей
-  - Random Forest          -- то, что уже использовалось в train_model.py
-  - Gradient Boosting      -- sklearn, бустинг деревьев
-  - XGBoost                -- популярный промышленный бустинг
-  - LightGBM               -- быстрый бустинг от Microsoft
-  - MLP (нейросеть)        -- простая полносвязная сеть
+Algorithms:
+  - Linear Regression      -- simplest baseline (linear dependence)
+  - Ridge Regression       -- linear + L2 regularization
+  - KNN                    -- k-nearest neighbours
+  - Random Forest          -- bagged decision trees
+  - Gradient Boosting      -- sklearn tree boosting
+  - XGBoost                -- gradient boosting (surrogate used in the paper)
+  - LightGBM               -- histogram-based gradient boosting
+  - MLP                    -- simple fully connected neural network
 
-ЗАПУСК:
+RUN:
     python3 compare_models.py
-Требует data/synthetic_dataset.csv
+Requires data/synthetic_dataset.csv
 """
 
 import time
@@ -36,8 +36,7 @@ from sklearn.model_selection import KFold, cross_val_score, cross_validate
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 
-FEATURES = ["x1_syre", "x2_davlenie", "x3_temperatura", "x4_skorost", "x5_vsg"]
-TARGETS = ["y1_obyem", "mu1_nepredelnye", "mu2_sera", "mu3_kisloty"]
+from generate_data import FEATURES, TARGETS
 
 MODELS = {
     "Linear Regression": LinearRegression(),
@@ -51,7 +50,7 @@ MODELS = {
                              random_state=42, n_jobs=-1, verbosity=0),
     "LightGBM": LGBMRegressor(n_estimators=400, max_depth=6, learning_rate=0.05,
                                random_state=42, n_jobs=-1, verbosity=-1),
-    "MLP (нейросеть)": make_pipeline(
+    "MLP": make_pipeline(
         StandardScaler(),
         MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=2000, random_state=42, early_stopping=True)
     ),
@@ -80,18 +79,18 @@ def main():
 
     all_rows = []
     for target in TARGETS:
-        print(f"\nСравнение моделей для: {target}")
+        print(f"\nModel comparison for: {target}")
         y = df[target].values
         rows = compare_on_target(X, y, target)
         rows_sorted = sorted(rows, key=lambda r: -r["R2_mean"])
         for r in rows_sorted:
             print(f"  {r['model']:20s}  R2={r['R2_mean']:.4f} (+/-{r['R2_std']:.4f})  "
-                  f"MAE={r['MAE_mean']:.4f}  время={r['time_sec']:.2f}с")
+                  f"MAE={r['MAE_mean']:.4f}  time={r['time_sec']:.2f}s")
         all_rows.extend(rows)
 
     results = pd.DataFrame(all_rows)
     results.to_csv("data/model_comparison.csv", index=False)
-    print("\nПолная таблица сохранена -> data/model_comparison.csv")
+    print("\nFull table saved -> data/model_comparison.csv")
 
     plot_comparison(results)
 
@@ -111,7 +110,7 @@ def plot_comparison(results):
 
     plt.tight_layout()
     plt.savefig("plots/model_comparison.png", dpi=130)
-    print("Сохранено: plots/model_comparison.png")
+    print("Saved: plots/model_comparison.png")
 
 
 if __name__ == "__main__":
